@@ -1,0 +1,11 @@
+pandas
+numpy
+scikit-learn
+statsbombpy
+mplsoccer
+matplotlib
+xgboost
+networkx
+scipy
+seaborn
+jupyter
