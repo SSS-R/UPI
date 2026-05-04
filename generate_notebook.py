@@ -28,6 +28,7 @@ PHASE_1_CODE = dedent(
     import warnings
 
     import matplotlib.pyplot as plt
+    import networkx as nx
     import numpy as np
     import pandas as pd
     import seaborn as sns
@@ -200,7 +201,29 @@ PHASE_1_CODE = dedent(
         }
     )
 
+    phase_1_audit = pd.DataFrame(
+        {
+            "roadmap_requirement": [
+                "Events joined to StatsBomb 360 frames",
+                "Every kept action has a normalized start coordinate",
+                "Moves have normalized end coordinates",
+                "Start zones mapped to 16x12 grid",
+                "Move end zones mapped to 16x12 grid",
+                "Attacking direction flag assigned",
+            ],
+            "coverage": [
+                events_filtered["360_frames"].notna().mean(),
+                events_filtered["location_normalized"].apply(is_location).mean(),
+                events_filtered.loc[events_filtered["type"].isin(["Pass", "Carry"]), "end_location_normalized"].apply(is_location).mean(),
+                events_filtered[["start_x_idx", "start_y_idx"]].notna().all(axis=1).mean(),
+                events_filtered.loc[events_filtered["type"].isin(["Pass", "Carry"]), ["end_x_idx", "end_y_idx"]].notna().all(axis=1).mean(),
+                events_filtered["attacking_right"].notna().mean(),
+            ],
+        }
+    )
+
     display(phase_1_summary)
+    display(phase_1_audit)
     events_filtered[
         [
             "minute",
@@ -343,10 +366,95 @@ PHASE_2_CODE = dedent(
             label = str(player_name).split()[-1]
             pitch.annotate(label, xy=(row["x"], row["y"] - 2), ax=axes[2], ha="center", va="center", fontsize=9)
 
+        graph = nx.DiGraph()
+        for _, row in pass_links.iterrows():
+            graph.add_edge(row["player"], row["pass_recipient"], weight=row["count"])
+
+        weighted_degree = dict(graph.degree(weight="weight"))
+        betweenness = nx.betweenness_centrality(graph, weight="weight", normalized=True) if graph.number_of_nodes() else {}
+        centrality_table = (
+            pd.DataFrame(
+                {
+                    "player": list(weighted_degree.keys()),
+                    "weighted_degree": list(weighted_degree.values()),
+                    "betweenness_centrality": [betweenness.get(player, 0.0) for player in weighted_degree.keys()],
+                }
+            )
+            .sort_values(["weighted_degree", "betweenness_centrality"], ascending=False)
+            .reset_index(drop=True)
+        )
+        display(centrality_table.head(12))
+
     axes[2].set_title(f"Passing Network: {team_for_eda}\\n(before first substitution)")
 
     plt.tight_layout()
     plt.show()
+
+    # Controlled flaw example: similar pass geometry, different defensive context.
+    context_passes = passes[
+        passes["360_frames_normalized"].notna()
+        & passes["end_location_normalized"].apply(is_location)
+        & passes["location_normalized"].apply(is_location)
+    ].copy()
+
+    def eda_nearby_opponents(row, radius=8.0):
+        frame = row.get("360_frames_normalized")
+        start = row.get("location_normalized")
+        if not isinstance(frame, list) or not is_location(start):
+            return 0
+        return sum(
+            1
+            for player in frame
+            if not player.get("teammate")
+            and is_location(player.get("location"))
+            and np.hypot(player["location"][0] - start[0], player["location"][1] - start[1]) <= radius
+        )
+
+    if len(context_passes) >= 2:
+        context_passes["pass_length"] = context_passes.apply(
+            lambda row: np.hypot(
+                row["end_location_normalized"][0] - row["location_normalized"][0],
+                row["end_location_normalized"][1] - row["location_normalized"][1],
+            ),
+            axis=1,
+        )
+        context_passes["nearby_opponents"] = context_passes.apply(eda_nearby_opponents, axis=1)
+        target_length = context_passes["pass_length"].median()
+        controlled = context_passes.loc[
+            (context_passes["pass_length"] - target_length).abs().sort_values().head(80).index
+        ].copy()
+        controlled_examples = pd.concat(
+            [
+                controlled.sort_values("nearby_opponents", ascending=False).head(1),
+                controlled.sort_values("nearby_opponents", ascending=True).head(1),
+            ]
+        ).drop_duplicates(subset=["id"])
+
+        display(
+            controlled_examples[
+                ["minute", "team", "player", "pass_recipient", "pass_length", "nearby_opponents", "under_pressure"]
+            ]
+        )
+
+        if len(controlled_examples) == 2:
+            fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+            for ax, (_, row) in zip(axes, controlled_examples.iterrows()):
+                pitch.draw(ax=ax)
+                frame = row["360_frames_normalized"]
+                teammate_locs = [p["location"] for p in frame if p.get("teammate") and is_location(p.get("location"))]
+                opponent_locs = [p["location"] for p in frame if not p.get("teammate") and is_location(p.get("location"))]
+                if teammate_locs:
+                    pitch.scatter([p[0] for p in teammate_locs], [p[1] for p in teammate_locs], ax=ax, color="#1f77b4", s=95, edgecolors="black")
+                if opponent_locs:
+                    pitch.scatter([p[0] for p in opponent_locs], [p[1] for p in opponent_locs], ax=ax, color="#d62728", s=95, edgecolors="black")
+                start = row["location_normalized"]
+                end = row["end_location_normalized"]
+                pitch.scatter([start[0]], [start[1]], ax=ax, s=170, color="#ffbf00", edgecolors="black")
+                pitch.arrows(start[0], start[1], end[0], end[1], ax=ax, color="#111111", width=2, headwidth=6)
+                ax.add_patch(plt.Circle((start[0], start[1]), 8.0, color="#e63946", fill=False, linestyle="--", linewidth=2))
+                ax.set_title(f"Similar pass, {int(row['nearby_opponents'])} nearby opponents")
+            plt.tight_layout()
+            plt.show()
     """
 ).strip()
 
@@ -472,22 +580,40 @@ PHASE_3_CODE = dedent(
     plt.tight_layout()
     plt.show()
 
+    xT_zone_values = pd.DataFrame(
+        {
+            "zone_id": np.arange(n_zones),
+            "x_idx": np.repeat(np.arange(grid_x_bins), grid_y_bins),
+            "y_idx": np.tile(np.arange(grid_y_bins), grid_x_bins),
+            "shot_count": shot_count.reshape(-1),
+            "goal_count": goal_count.reshape(-1),
+            "move_count": move_attempt_count.reshape(-1),
+            "shot_prob": s_prob.reshape(-1),
+            "goal_prob": g_prob.reshape(-1),
+            "move_prob": m_prob.reshape(-1),
+            "xT": xT_surface.reshape(-1),
+        }
+    )
+    xT_zone_values.to_csv("data/processed/xT_16x12_surface.csv", index=False)
+
+    transition_matrix = pd.DataFrame(T)
+    transition_matrix.to_csv("data/processed/xT_transition_matrix.csv", index=False)
+
+    xT_artifact_summary = pd.DataFrame(
+        {
+            "artifact": ["xT zones", "transition matrix rows", "transition matrix columns", "xT csv"],
+            "value": [len(xT_zone_values), T.shape[0], T.shape[1], "data/processed/xT_16x12_surface.csv"],
+        }
+    )
+
     zone_summary = (
-        pd.DataFrame(
-            {
-                "x_idx": np.repeat(np.arange(grid_x_bins), grid_y_bins),
-                "y_idx": np.tile(np.arange(grid_y_bins), grid_x_bins),
-                "shot_prob": s_prob.reshape(-1),
-                "goal_prob": g_prob.reshape(-1),
-                "move_prob": m_prob.reshape(-1),
-                "xT": xT_surface.reshape(-1),
-            }
-        )
+        xT_zone_values
         .sort_values("xT", ascending=False)
         .head(12)
         .reset_index(drop=True)
     )
 
+    display(xT_artifact_summary)
     display(zone_summary)
     """
 ).strip()
