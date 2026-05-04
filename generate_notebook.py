@@ -279,6 +279,8 @@ PHASE_2_CODE = dedent(
     pitch.scatter(opponents_x, opponents_y, ax=axes[1], s=130, color="#d62728", edgecolors="black", label="Opponents")
     if is_location(start):
         pitch.scatter([start[0]], [start[1]], ax=axes[1], s=180, color="#ffbf00", edgecolors="black", label="Ball carrier")
+        pressure_circle = plt.Circle((start[0], start[1]), 8.0, color="#e63946", fill=False, linestyle="--", linewidth=2, alpha=0.9)
+        axes[1].add_patch(pressure_circle)
     if is_location(start) and is_location(end):
         pitch.arrows(start[0], start[1], end[0], end[1], ax=axes[1], color="#111111", width=2, headwidth=6)
 
@@ -725,17 +727,49 @@ PHASE_5_CODE = dedent(
         stability["actual_completion"] - stability["expected_completion"]
     ) * np.log1p(stability["pass_count"])
 
+    match_duration = float(events_df["minute"].max() + 1)
+    minute_rows = []
+    for _, row in events_df[events_df["type"] == "Starting XI"].iterrows():
+        tactics = row.get("tactics")
+        if isinstance(tactics, dict):
+            for player_info in tactics.get("lineup", []):
+                player_name = player_info.get("player", {}).get("name")
+                if player_name:
+                    minute_rows.append({"player": player_name, "start_minute": 0.0, "end_minute": match_duration})
+
+    for _, row in events_df[events_df["type"] == "Substitution"].iterrows():
+        team = row.get("team")
+        sub_minute = float(row.get("minute", 0))
+        player_off = row.get("player")
+        player_on = row.get("substitution_replacement")
+        for item in minute_rows:
+            if item["player"] == player_off:
+                item["end_minute"] = min(item["end_minute"], sub_minute)
+        if pd.notna(player_on):
+            minute_rows.append({"player": player_on, "start_minute": sub_minute, "end_minute": match_duration})
+
+    minutes_played = pd.DataFrame(minute_rows)
+    if minutes_played.empty:
+        minutes_played = pd.DataFrame({"player": upi["player"], "minutes_played": match_duration})
+    else:
+        minutes_played["minutes_played"] = (minutes_played["end_minute"] - minutes_played["start_minute"]).clip(lower=1)
+        minutes_played = minutes_played.groupby("player", as_index=False)["minutes_played"].sum()
+
     upi = on_ball.merge(off_ball, on="player", how="outer")
     upi = upi.merge(defensive, on="player", how="outer")
     upi = upi.merge(stability[["player", "C_stability", "pass_count"]], on="player", how="outer")
+    upi = upi.merge(minutes_played, on="player", how="left")
     for col in ["C_on_ball", "C_off_ball", "C_defensive", "C_stability", "pass_count"]:
         upi[col] = upi[col].fillna(0.0)
+    upi["minutes_played"] = upi["minutes_played"].fillna(match_duration).clip(lower=1)
+    for col in ["C_on_ball", "C_off_ball", "C_defensive", "C_stability"]:
+        upi[f"{col}_per90"] = upi[col] * 90 / upi["minutes_played"]
 
     upi["UPI_raw"] = (
-        0.45 * robust_zscore(upi["C_on_ball"])
-        + 0.20 * robust_zscore(upi["C_off_ball"])
-        + 0.20 * robust_zscore(upi["C_defensive"])
-        + 0.15 * robust_zscore(upi["C_stability"])
+        0.45 * robust_zscore(upi["C_on_ball_per90"])
+        + 0.20 * robust_zscore(upi["C_off_ball_per90"])
+        + 0.20 * robust_zscore(upi["C_defensive_per90"])
+        + 0.15 * robust_zscore(upi["C_stability_per90"])
     )
     upi["UPI_rating"] = 6.0 + robust_zscore(upi["UPI_raw"])
     upi["UPI_rating"] = upi["UPI_rating"].clip(0, 10)
@@ -772,7 +806,8 @@ PHASE_6_MD = dedent(
 
 PHASE_6_CODE = dedent(
     """
-    from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+    from sklearn.metrics import brier_score_loss, log_loss, mean_squared_error, roc_auc_score
+    from sklearn.model_selection import KFold
 
     validation_shots = events_df[events_df["type"] == "Shot"].copy()
     validation_shots["goal"] = validation_shots["shot_outcome"].eq("Goal").astype(int)
@@ -791,6 +826,7 @@ PHASE_6_CODE = dedent(
         .reset_index()
     )
     team_validation["error"] = team_validation["actual_goals"] - team_validation["expected_goals"]
+    team_rmse = np.sqrt(mean_squared_error(team_validation["actual_goals"], team_validation["expected_goals"]))
     display(team_validation)
 
     brier = brier_score_loss(validation_shots["goal"], validation_shots["model_prob"])
@@ -801,16 +837,46 @@ PHASE_6_CODE = dedent(
         else np.nan
     )
 
+    kfold = KFold(n_splits=min(5, len(validation_shots)), shuffle=True, random_state=42)
+    fold_rows = []
+    for fold_id, (_, test_idx) in enumerate(kfold.split(validation_shots), start=1):
+        fold = validation_shots.iloc[test_idx]
+        fold_rows.append(
+            {
+                "fold": fold_id,
+                "shots": len(fold),
+                "expected_goals": fold["model_prob"].sum(),
+                "actual_goals": fold["goal"].sum(),
+            }
+        )
+    kfold_validation = pd.DataFrame(fold_rows)
+    kfold_rmse = np.sqrt(mean_squared_error(
+        kfold_validation["actual_goals"],
+        kfold_validation["expected_goals"],
+    ))
+
     rng = np.random.default_rng(42)
     bootstrap_goals = rng.binomial(1, validation_shots["model_prob"].to_numpy(), size=(1000, len(validation_shots))).sum(axis=1)
     actual_goals = int(validation_shots["goal"].sum())
     validation_metrics = pd.DataFrame(
         {
-            "metric": ["Brier score", "Log loss", "ROC AUC", "Actual goals", "Bootstrap mean goals", "Bootstrap 5th pct", "Bootstrap 95th pct"],
+            "metric": [
+                "Brier score",
+                "Log loss",
+                "ROC AUC",
+                "Team-goal RMSE",
+                "K-fold goal RMSE",
+                "Actual goals",
+                "Bootstrap mean goals",
+                "Bootstrap 5th pct",
+                "Bootstrap 95th pct",
+            ],
             "value": [
                 brier,
                 logloss,
                 auc,
+                team_rmse,
+                kfold_rmse,
                 actual_goals,
                 bootstrap_goals.mean(),
                 np.percentile(bootstrap_goals, 5),
@@ -818,6 +884,7 @@ PHASE_6_CODE = dedent(
             ],
         }
     )
+    display(kfold_validation)
     display(validation_metrics)
 
     fig, ax = plt.subplots(figsize=(9, 5))
